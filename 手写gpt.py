@@ -35,6 +35,14 @@ class MyDataSet(Data.Dataset):
         decoder_input  = 整段对话的字 id 序列去掉最后一个字
         decoder_output = 整段对话的字 id 序列去掉第一个字（即输入右移一位）
     模型看到 decoder_input，努力预测出 decoder_output，这就是"学习"。
+
+    举个具体例子：假设对话"你好"转成 id 后是 [10, 20, 2, 2]（2 是 <sep>，表示"说完了"）：
+        decoder_input  = [10, 20, 2]      # 去掉最后一个 2
+        decoder_output = [20, 2, 2]      # 整体右移一位
+    含义：看到 [10]        -> 应预测出 20（"你"的下一个字是"好"）
+          看到 [10, 20]    -> 应预测出 2（"你好"说完了）
+          看到 [10, 20, 2] -> 应预测出 2（整段对话结束）
+    一次前向传播中，每个位置都在同时做"预测下一个字"，一起算损失、一起学习。
     """
 
     def __init__(self, datas):
@@ -65,6 +73,7 @@ class MyDataSet(Data.Dataset):
                 "decoder_output": decoder_output, "decoder_output_len": decoder_output_len}
 
     def __len__(self):
+        # 返回数据集里一共有多少段对话（DataLoader 靠它知道要取几个样本）
         return len(self.datas)
 
     # collate_fn：DataLoader 在取出一批样本后调用它，
@@ -98,6 +107,12 @@ def make_pad_mask(seq_q, seq_k):
     原因：句子被填充后的那些空白位置没有真实含义，不能让模型"注意"到它们。
     seq_q: 查询序列 [batch, len_q]，seq_k: 键序列 [batch, len_k]
     返回 [batch, len_q, len_k] 的布尔矩阵，seq_k 中是 0（即 <pad>）的位置为 True。
+
+    例子：seq_k = [5, 8, 0, 0]（后两个 0 是填充）且 len_q = 4 时，返回：
+        [[F, F, T, T],
+         [F, F, T, T],
+         [F, F, T, T],
+         [F, F, T, T]]     <- 第 3、4 列是 True：所有字都禁止去"注意"填充位
     """
     batch_size, len_q = seq_q.size()
     batch_size, len_k = seq_k.size()
@@ -111,6 +126,11 @@ def make_lookahead_mask(seq):
     因为 GPT 是一个一个往后预测的，预测第 n 个字时，只能看到它前面的字，
     不能看到后面的字（否则就作弊了）。
     返回 [batch, seq_len, seq_len] 的矩阵，上三角（k=1 以上）位置为 1（需要被遮住）。
+
+    例子：长度为 3 的序列返回：
+        [[0, 1, 1],
+         [0, 0, 1],
+         [0, 0, 0]]     <- 第 1 行：预测第 1 个字时，第 2、3 个字（"未来"）被遮住
     """
     attn_shape = [seq.size(0), seq.size(1), seq.size(1)]          # [batch, len, len]
     subsequence_mask = np.triu(np.ones(attn_shape), k=1)          # 生成上三角全 1 矩阵
@@ -153,11 +173,12 @@ class MultiHeadAttention(nn.Module):
         attn_mask = attn_mask.unsqueeze(1).repeat(1, n_heads, 1, 1)
 
         # 缩放点积注意力得分：Q 和 K 做内积，除以 sqrt(d_k) 防止数值过大
+        # 形状变化：Q [b, h, len, 64] x K^T [b, h, 64, len] -> scores [b, h, len_q, len_k]
         scores = torch.matmul(Q, K.transpose(-1, -2)) / np.sqrt(d_k)
         scores.masked_fill_(attn_mask, -1e9)   # 被 mask 的位置填一个极小值，softmax 后概率趋近于 0
 
-        attn = nn.Softmax(dim=-1)(scores)      # 对最后一个维度做 softmax，得到每个位置的注意力权重
-        context = torch.matmul(attn, V)        # 用权重对 V 做加权求和，得到融合后的信息
+        attn = nn.Softmax(dim=-1)(scores)      # 对最后一个维度做 softmax -> 注意力权重，每行加起来等于 1
+        context = torch.matmul(attn, V)         # 用权重对 V 做加权求和 -> [b, h, len_q, 64]，每个字得到"融合了上下文"的新表示
 
         # 把多头结果拼回去并过一层线性层，再加残差、做层归一化
         context = context.transpose(1, 2).reshape(batch_size, -1, n_heads * d_v)
@@ -281,7 +302,11 @@ class GPT_Model(nn.Module):
 
     # ---------- 生成回答的方式一：贪心解码（每步选概率最大的字） ----------
     def greedy_decoder(self, dec_input):
-        """输入一个句子（转成 id），一个一个字地往后预测，直到预测出 <sep> 结束。"""
+        """输入一个句子（转成 id），一个一个字地往后预测，直到预测出 <sep> 结束。
+
+        原理：把"当前的整句话"喂给模型，模型对最后一个位置的预测就是"下一个字"；
+              把这个字拼到句尾，再喂回去……如此循环，直到吐出 <sep> 或超过 100 字。
+        """
         terminal = False
         start_dec_len = len(dec_input[0])   # 记录初始长度，防止无限循环
 
@@ -303,6 +328,7 @@ class GPT_Model(nn.Module):
                 terminal = True
 
             # 把新预测出的字拼到序列末尾，继续下一轮预测
+            # detach()：断开与计算图的连接（推理阶段不需要梯度）；cat：在序列末尾拼接新字
             dec_input = torch.cat([dec_input.detach(), torch.tensor([[next_symbol]], dtype=dec_input.dtype, device=device)], -1)
 
         return dec_input    # 返回完整序列（原句 + 模型续写的部分）
@@ -325,11 +351,13 @@ class GPT_Model(nn.Module):
                 dec_outputs, _ = self.decoder(dec_input)
                 projected = self.projection(dec_outputs)   # [1, len, vocab_size]
 
-            # 下面做"按概率采样"：
+            # 下面做"按概率采样"（轮盘赌法）：
+            # 直观理解：把候选字的得分当成轮盘上的格子大小，得分越高格子越大；
+            # 随机扔一次骰子，落在哪个格子就选哪个字 —— 既保留随机性，又偏向高分字
             a = projected.to('cpu')             # [1, len, vocab_size] 移到 CPU 上操作
             b = a.squeeze(0)[-1]                # 只取最后一个位置： [vocab_size] 每个字的得分
             c, idx1 = torch.sort(b, descending=True)   # 从大到小排序：c=得分，idx1=对应的字 id
-            c = np.array(c[:top_n]) ** 2        # 只保留概率最高的前 top_n 个，并平方放大差距
+            c = np.array(c[:top_n]) ** 2        # 只保留概率最高的前 top_n 个，并平方放大差距（高分字更容易被抽中）
             idx1 = np.array(idx1[:top_n])       # 对应的字 id
 
             sum = 0                             # 计算前 top_n 个得分的总和
@@ -366,6 +394,7 @@ class GPT_Model(nn.Module):
         # 找出所有 <sep> 的位置：
         # 第一个 <sep> 是提问结束，最后一个 <sep> 是回答结束，
         # 两者之间就是模型生成的回答内容
+        # 例：out = [你,好,<sep>,我,很,好,<sep>] -> 提取出的 answer = "我很好"
         sep_indexs = []
         for i in range(len(out)):
             if out[i] == "<sep>":
@@ -403,16 +432,16 @@ if __name__ == "__main__":
     word_2_index = {w: i for i, w in enumerate(index_2_word)}   # 字 -> 索引（查表用）
     vocab_size = len(word_2_index)                   # 词表大小
 
-    # ----- 3. 模型超参数 -----
-    max_pos = 300        # 支持的最大序列长度（位置嵌入表的长度）
-    d_model = 768        # 每个字的向量维度（隐藏层大小）
-    d_ff = 2048          # 前馈层的中间维度（通常比 d_model 大）
-    d_k = d_v = 64       # 每个注意力头里 Q/K/V 的维度
-    n_layers = 6         # Decoder 层数
-    n_heads = 8          # 注意力头数
-    CLIP = 1             # 梯度裁剪上限（防止梯度爆炸）
-    batch_size = 1       # 每批 1 段对话
-    epochs = 10          # 训练轮数
+    # ----- 3. 模型超参数（模型的"设计尺寸"，决定了模型的大小和能力） -----
+    max_pos = 300        # 支持的最大序列长度（位置嵌入表 300 行；对话总长超过 300 会越界报错）
+    d_model = 768        # 每个字的向量维度（隐藏层大小，与 GPT-2 small 相同）
+    d_ff = 2048          # 前馈层的中间维度（先把 768 放大到 2048 再缩回来，通常约为 d_model 的 2~4 倍）
+    d_k = d_v = 64       # 每个注意力头里 Q/K/V 的维度；768 = 8 个头 x 64，多头拼起来正好回到 768
+    n_layers = 6         # Decoder 层数（模型有多"深"）
+    n_heads = 8          # 注意力头数（8 组不同"视角"并行看序列）
+    CLIP = 1             # 梯度裁剪上限（梯度总长超过 1 就等比缩小，防止梯度爆炸导致训练发散）
+    batch_size = 1       # 每批 1 段对话（对话长短不一，取 1 最简单稳妥）
+    epochs = 10          # 训练轮数（把 30 段对话完整过 10 遍）
     device = "cuda" if torch.cuda.is_available() else "cpu"   # 有 GPU 用 GPU，否则用 CPU
 
     # ----- 4. 构建数据集和加载器 -----
@@ -436,14 +465,18 @@ if __name__ == "__main__":
             loss.backward()                                 # 反向传播计算梯度
             torch.nn.utils.clip_grad_norm_(model.parameters(), CLIP)  # 梯度裁剪
             optimizer.step()                                # 更新参数
-            optimizer.zero_grad()                           # 清空梯度，准备下一步
-        end_time = time.time()
+            optimizer.zero_grad()                           # 清空梯度，准备下一批
+        end_time = time.time()   # 原代码遗留的计时语句（本代码中没有使用）
 
         # 每轮结束打印一次平均损失（越小说明模型学得越好）
         train_loss = epoch_loss
         print(f'\tTrain Loss: {train_loss:.3f}')
 
-    # 保存训练好的模型（取消注释即可保存）
+    # 保存训练好的模型（取消注释即可保存）。
+    # 注意 1：把文件名改成 'model.pt' 才能被 predict.py 直接加载。
+    # 注意 2：本文件的模型结构（每层"双注意力"）与 predict.py（每层"单注意力"）不同，
+    #         所以本文件训练出的权重无法直接给 predict.py 用；想用 predict.py 推理，
+    #         需要按 predict.py 的结构训练出对应的 model.pt（详见 README.md"常见坑"）。
     # torch.save(model.state_dict(), r'model1.pt')
 
     # ----- 7. 进入对话模式：输入一句话，模型自动续写回答 -----
@@ -454,7 +487,7 @@ if __name__ == "__main__":
         sentence = ''
         temp_sentence = input("请输入:")
         sentence += (temp_sentence + '\t')      # 用 \t 标记"提问到此结束"
-        if len(sentence) > 200:                 # 太长的对话只保留最近的一段（从最后一个 \t 之后）
+        if len(sentence) > 200:                 # 输入超 200 字时只保留第一个 \t 之后的部分（防止超出位置嵌入 300 的上限）
             t_index = sentence.find('\t')
             sentence = sentence[t_index + 1:]
         print("GPT_Model:", model.answer(sentence))

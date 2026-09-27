@@ -28,7 +28,11 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 # ============================================================
 
 def get_attn_pad_mask(seq_q, seq_k):
-    """padding 掩码：把 <pad>(id=0) 的位置遮住，不让模型注意没有意义的填充位。"""
+    """padding 掩码：把 <pad>(id=0) 的位置遮住，不让模型注意没有意义的填充位。
+
+    例子：seq_k = [5, 8, 0, 0]（后两个 0 是填充）且 len_q = 4 时，
+    返回 [batch, 4, 4] 的矩阵，其中第 3、4 列全为 True（所有字都禁止看填充位）。
+    """
     batch_size, len_q = seq_q.size()
     batch_size, len_k = seq_k.size()
 
@@ -37,7 +41,11 @@ def get_attn_pad_mask(seq_q, seq_k):
 
 
 def get_attn_subsequence_mask(seq):
-    """因果掩码（上三角矩阵）：预测当前位置时不能偷看后面的字（未来）。"""
+    """因果掩码（上三角矩阵）：预测当前位置时不能偷看后面的字（未来）。
+
+    例子：长度为 3 的序列返回 [[0,1,1],[0,0,1],[0,0,0]]，
+    1 表示"要遮住"，即第 1 个字不能看到第 2、3 个字。
+    """
     attn_shape = [seq.size(0), seq.size(1), seq.size(1)]
     subsequence_mask = np.triu(np.ones(attn_shape), k=1)    # 上三角全 1
     subsequence_mask = torch.from_numpy(subsequence_mask).byte()
@@ -55,11 +63,12 @@ class ScaledDotProductAttention(nn.Module):
         super(ScaledDotProductAttention, self).__init__()
 
     def forward(self, Q, K, V, attn_mask):
-        scores = torch.matmul(Q, K.transpose(-1, -2)) / np.sqrt(d_k)  # 相似度得分，除以 sqrt(d_k) 防数值过大
+        # 输入形状：Q [b, h, len_q, 64]，K/V [b, h, len_k, 64]
+        scores = torch.matmul(Q, K.transpose(-1, -2)) / np.sqrt(d_k)  # 相似度得分 [b, h, len_q, len_k]，除以 sqrt(d_k) 防数值过大
         scores.masked_fill_(attn_mask, -1e9)                          # 被 mask 的位置填极小值，softmax 后约等于 0
 
-        attn = nn.Softmax(dim=-1)(scores)     # 归一化成注意力权重
-        context = torch.matmul(attn, V)       # 加权求和，得到每个位置融合后的表示
+        attn = nn.Softmax(dim=-1)(scores)     # 归一化成注意力权重（每行加起来等于 1）
+        context = torch.matmul(attn, V)       # 加权求和 [b, h, len_q, 64]，得到每个位置融合后的表示
         return context, attn
 
 
@@ -152,11 +161,11 @@ class Decoder(nn.Module):
         self.layers = nn.ModuleList([DecoderLayer() for _ in range(n_layers)])
 
     def forward(self, dec_inputs):
-        seq_len = dec_inputs.size(1)
+        seq_len = dec_inputs.size(1)                                   # 当前序列长度
         pos = torch.arange(seq_len, dtype=torch.long, device=device)  # 位置索引 [0,1,2,...]
-        pos = pos.unsqueeze(0).expand_as(dec_inputs)
+        pos = pos.unsqueeze(0).expand_as(dec_inputs)                   # 扩成 [batch, len]，每个样本共用同一套位置号
 
-        dec_outputs = self.tgt_emb(dec_inputs) + self.pos_emb(pos)  # 词向量 + 位置向量
+        dec_outputs = self.tgt_emb(dec_inputs) + self.pos_emb(pos)  # 词向量 + 位置向量 -> [batch, len, d_model]
 
         # 合并两个 mask：遮住 <pad> + 遮住未来
         dec_self_attn_pad_mask = get_attn_pad_mask(dec_inputs, dec_inputs)
@@ -184,12 +193,17 @@ class GPT(nn.Module):
 
     def forward(self, dec_inputs):
         dec_outputs, dec_self_attns = self.decoder.forward(dec_inputs)   # [batch, len, d_model]
-        dec_logits = self.projection(dec_outputs)                        # [batch, len, vocab_size]
+        dec_logits = self.projection(dec_outputs)                        # [batch, len, vocab_size]：每个位置对每个字的得分
+        # 展平成 [batch*len, vocab_size]，方便逐步取"最后一个位置"的预测
         return dec_logits.view(-1, dec_logits.size(-1)), dec_self_attns
 
     # ---------- 贪心解码：每步选概率最大的字 ----------
     def greedy_decoder(self, dec_input):
-        """从给定句子开始，一个一个字往后预测，直到预测出 <sep> 为止。"""
+        """从给定句子开始，一个一个字往后预测，直到预测出 <sep> 为止。
+
+        原理：把"当前的整句话"喂给模型，模型对最后一个位置的预测就是"下一个字"；
+              把这个字拼到句尾，再喂回去……如此循环，直到吐出 <sep> 或超过 100 字。
+        """
         terminal = False
         start_dec_len = len(dec_input[0])
 
@@ -210,6 +224,7 @@ class GPT(nn.Module):
             if next_symbol == word2id["<sep>"]:        # 生成 <sep> 表示回答结束
                 terminal = True
 
+            # detach() 断开与计算图的连接（推理不需要梯度）；把新字拼到序列末尾，进入下一轮预测
             dec_input = torch.cat(
                 [dec_input.detach(), torch.tensor([[next_symbol]], dtype=dec_input.dtype, device=device)], -1)
 
@@ -217,7 +232,11 @@ class GPT(nn.Module):
 
     # ---------- 随机采样解码：按概率随机选字，回答更多样 ----------
     def random_decoder(self, dec_input, top_n):
-        """和贪心解码类似，但不是每次选最大，而是按概率随机采样（top_n 个候选）。"""
+        """和贪心解码类似，但不是每次选最大，而是按概率随机采样（top_n 个候选）。
+
+        原理：先取概率最高的 top_n 个字当候选，再按得分大小"抽签"选一个；
+              这样每次生成的回答都可能不一样，更自然、更多样。
+        """
         terminal = False
         start_dec_len = len(dec_input[0])
 
@@ -233,12 +252,13 @@ class GPT(nn.Module):
                 dec_outputs, _ = self.decoder(dec_input)
                 projected = self.projection(dec_outputs)   # [1, len, vocab_size]
 
-            # 按概率采样（轮盘赌）：
+            # 按概率采样（轮盘赌法）：把候选字的得分当成轮盘上的格子大小，得分越高格子越大；
+            # 随机扔一次骰子，落在哪个格子就选哪个字 —— 既保留随机性，又偏向高分字
             a = projected.to('cpu')            # 移到 CPU 操作
             b = a.squeeze(0)[-1]               # 只取最后一个位置 [vocab_size]
             c, idx1 = torch.sort(b, descending=True)   # 得分从大到小排序，idx1 是对应的字 id
-            c = np.array(c[:top_n]) ** 2       # 保留前 top_n 个，平方放大概率差距
-            idx1 = np.array(idx1[:top_n])
+            c = np.array(c[:top_n]) ** 2       # 保留前 top_n 个，平方放大概率差距（高分字更容易被抽中）
+            idx1 = np.array(idx1[:top_n])      # 对应的前 top_n 个字的 id
 
             sum = 0                            # 前 top_n 个得分之和
             for i in c:
@@ -271,6 +291,7 @@ class GPT(nn.Module):
         out = [id2word[int(id)] for id in output]   # id 还原成字
 
         # 找 <sep> 的位置：提问结束的 <sep> 和回答结束的 <sep> 之间就是回答内容
+        # 例：out = [你,好,<sep>,我,很,好,<sep>] -> 提取出的 answer = "我很好"
         sep_indexs = []
         for i in range(len(out)):
             if out[i] == "<sep>":
@@ -288,12 +309,12 @@ if __name__ == '__main__':
     # 0. 模型超参数（必须和训练 model.pt 时完全一致，否则权重加载不上）
     #    （数值对应 model.pt 的维度：词表 7548、d_model 768、max_pos 300、d_ff 2048、
     #      d_k=d_v=64、n_heads=8、n_layers=6，可用 torch.load 后查看 weight 形状核对）
-    max_pos = 300        # 支持的最大序列长度（位置嵌入表的长度）
-    d_model = 768        # 每个字的向量维度（隐藏层大小）
-    d_ff = 2048          # 前馈层的中间维度
-    d_k = d_v = 64       # 每个注意力头里 Q/K/V 的维度
-    n_layers = 6         # Decoder 层数
-    n_heads = 8          # 注意力头数
+    max_pos = 300        # 支持的最大序列长度（位置嵌入表 300 行；序列超过 300 会越界）
+    d_model = 768        # 每个字的向量维度（隐藏层大小，与 GPT-2 small 相同）
+    d_ff = 2048          # 前馈层的中间维度（先放大到 2048 再缩回 768）
+    d_k = d_v = 64       # 每个注意力头里 Q/K/V 的维度；768 = 8 头 x 64
+    n_layers = 6         # Decoder 层数（模型有多"深"）
+    n_heads = 8          # 注意力头数（8 组不同"视角"并行看序列）
 
     # 1. 加载词表（必须和训练时用同一个 vocab.txt，否则字和 id 对应不上）
     with open("data/vocab.txt", encoding="utf-8") as f:
@@ -301,8 +322,11 @@ if __name__ == '__main__':
     word2id = {w: i for i, w in enumerate(id2word)}          # 字 -> 索引
     vocab_size = len(word2id)                                # 词表大小
 
-    # 2. 创建模型并加载训练好的权重（model.pt 必须是训练时保存的）
+    # 2. 创建模型并加载训练好的权重（model.pt 必须是"结构一致"的代码训练保存的；
+    #    *.pt 已被 .gitignore 排除，仓库里没有这个文件，需要自己先训练生成）
     model = GPT().to(device)
+    # 提示：在没有 GPU 的电脑上加载 GPU 训练出的权重时，
+    #       改成 torch.load('model.pt', map_location='cpu') 即可
     model.load_state_dict(torch.load('model.pt'))
 
     # 3. 进入对话模式
